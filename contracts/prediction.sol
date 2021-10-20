@@ -1,13 +1,75 @@
 // SPDX-License-Identifier: MIT
-import "./dependencies.sol";
-
 pragma solidity ^0.8.0;
 pragma abicoder v2;
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+interface AggregatorV3Interface {
+
+  function decimals()
+    external
+    view
+    returns (
+      uint8
+    );
+
+  function description()
+    external
+    view
+    returns (
+      string memory
+    );
+
+  function version()
+    external
+    view
+    returns (
+      uint256
+    );
+
+  // getRoundData and latestRoundData should both raise "No data present"
+  // if they do not have data to report, instead of returning unset values
+  // which could be misinterpreted as actual reported values.
+  function getRoundData(
+    uint80 _roundId
+  )
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+}
 
 /**
  * @title PancakePredictionV2
  */
-contract Prediction is Ownable, Pausable, ReentrancyGuard {
+contract Prediction is 
+    Initializable,
+    OwnableUpgradeable, 
+    PausableUpgradeable, 
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
 
@@ -20,8 +82,9 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     uint256 public bufferSeconds; // number of seconds for valid execution of a prediction round
     uint256 public intervalSeconds; // interval in seconds between two prediction rounds
 
-    uint256 public minBetAmount; // minimum betting amount (denominated in wei)
+    uint256 public betAmount; // betting amount (denominated in wei)
     uint256 public treasuryAmount; // treasury amount that was not claimed
+    uint256 public tokenMaxBet; // maximum number of bets for a token per round
 
     uint256 public currentEpoch; // current epoch for prediction round
 
@@ -44,14 +107,15 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
     struct Round {
         uint256 epoch;
-        uint256 startTimestamp;
-        uint256 endTimestamp;
+        uint256 lockedTimestamp;
+        uint256 closeTimestamp;
         uint256 totalAmount;
         bool oraclesCalled;
-        mapping(address => uint256) startOracleIds;
-        mapping(address => uint256) endOracleIds;
-        mapping(address => int) startPrices;
-        mapping(address => int) endPrices;
+        mapping(address => uint256) lockedOracleIds;
+        mapping(address => uint256) closeOracleIds;
+        mapping(address => uint256) bets;
+        mapping(address => int) lockedPrices;
+        mapping(address => int) closePrices;
     }
 
     struct BetInfo {
@@ -61,14 +125,15 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         bool claimed; // default false
     }
 
-    event BetBear(address indexed sender, uint256 indexed epoch, uint256 amount);
-    event BetBull(address indexed sender, uint256 indexed epoch, uint256 amount);
+    event BetBear(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
+    event BetBull(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
     event Claim(address indexed sender, uint256 indexed epoch, uint256 amount);
     event EndRound(uint256 indexed epoch, uint256 indexed roundId, int256 price);
 
     event NewAdminAddress(address admin);
     event NewBufferAndIntervalSeconds(uint256 bufferSeconds, uint256 intervalSeconds);
-    event NewMinBetAmount(uint256 indexed epoch, uint256 minBetAmount);
+    event NewBetAmount(uint256 indexed epoch, uint256 betAmount);
+    event NewTokenMaxBet(uint256 tokenMaxBet);
 
     event NewOperatorAddress(address operator);
     event NewOracle(address oracle, address token);
@@ -110,25 +175,33 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @param _operatorAddress: operator address
      * @param _intervalSeconds: number of time within an interval
      * @param _bufferSeconds: buffer of time for resolution of price
-     * @param _minBetAmount: minimum bet amounts (in wei)
+     * @param _betAmount: minimum bet amounts (in wei)
      * @param _oracleUpdateAllowance: oracle update allowance
      */
-    constructor(
+    function initialize(
         address _adminAddress,
         address _operatorAddress,
         uint256 _intervalSeconds,
         uint256 _bufferSeconds,
-        uint256 _minBetAmount,
-        uint256 _oracleUpdateAllowance
-    ) {
+        uint256 _betAmount,
+        uint256 _oracleUpdateAllowance,
+        uint256 _tokenMaxBet
+    ) public initializer {
+        
+        __Ownable_init();
 
         adminAddress = _adminAddress;
         operatorAddress = _operatorAddress;
         intervalSeconds = _intervalSeconds;
         bufferSeconds = _bufferSeconds;
-        minBetAmount = _minBetAmount;
+        betAmount = _betAmount;
         oracleUpdateAllowance = _oracleUpdateAllowance;
+        tokenMaxBet = _tokenMaxBet;
     }
+    
+    // Authourizes upgrade to be done by the proxy. Theis contract uses a UUPS upgrade model
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner{}
+    
     
     function addTokens(address[] memory _tokens, address[] memory _oracles) external whenNotPaused onlyAdmin{
         for (uint i = 0; i < _tokens.length; i++){
@@ -158,17 +231,19 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @notice Bet bear position
      * @param epoch: epoch
      */
-    function betBear(uint256 epoch, address token) external payable whenNotPaused nonReentrant notContract {
+    function predictBear(uint256 epoch, address token) external whenNotPaused nonReentrant notContract {
         require(epoch == currentEpoch, "Bet is too early/late");
         require(_bettable(epoch), "Round not bettable");
         require(ledger[epoch][msg.sender].amount == 0, "Can only bet once per round");
         require(address(oracles[token]) != address(0), "Can't predict for token");
+        require(rounds[epoch].bets[token] <= tokenMaxBet);
 
         // Update round data
-        uint256 amount = minBetAmount;
+        uint256 amount = betAmount;
         pred.safeTransferFrom(msg.sender, address(this), amount);
         Round storage round = rounds[epoch];
         round.totalAmount = round.totalAmount + amount;
+        rounds[epoch].bets[token] += 1;
 
         // Update user data
         BetInfo storage betInfo = ledger[epoch][msg.sender];
@@ -177,24 +252,26 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         betInfo.token = token;
         userRounds[msg.sender].push(epoch);
 
-        emit BetBear(msg.sender, epoch, amount);
+        emit BetBear(msg.sender, epoch, msg.sender, amount);
     }
 
     /**
      * @notice Bet bull position
      * @param epoch: epoch
      */
-    function betBull(uint256 epoch, address token) external payable whenNotPaused nonReentrant notContract {
+    function predictBull(uint256 epoch, address token) external whenNotPaused nonReentrant notContract {
         require(epoch == currentEpoch, "Bet is too early/late");
         require(_bettable(epoch), "Round not bettable");
         require(ledger[epoch][msg.sender].amount == 0, "Can only bet once per round");
         require(address(oracles[token]) != address(0), "Can't predict for token");
+        require(rounds[epoch].bets[token] <= tokenMaxBet);
 
         // Update round data
-        uint256 amount = minBetAmount;
+        uint256 amount = betAmount;
         pred.safeTransferFrom(msg.sender, address(this), amount);
         Round storage round = rounds[epoch];
         round.totalAmount = round.totalAmount + amount;
+        rounds[epoch].bets[token] += 1;
 
         // Update user data
         BetInfo storage betInfo = ledger[epoch][msg.sender];
@@ -203,8 +280,9 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         betInfo.token = token;
         userRounds[msg.sender].push(epoch);
 
-        emit BetBull(msg.sender, epoch, amount);
+        emit BetBull(msg.sender, epoch, msg.sender, amount);
     }
+    
 
     /**
      * @notice Claim refund for an array of epochs
@@ -214,15 +292,15 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         uint256 reward; // Initializes reward
 
         for (uint256 i = 0; i < epochs.length; i++) {
-            require(rounds[epochs[i]].startTimestamp != 0, "Round has not started");
-            require(block.timestamp > rounds[epochs[i]].endTimestamp, "Round has not ended");
+            require(rounds[epochs[i]].lockedTimestamp != 0, "Round has not started");
+            require(block.timestamp > rounds[epochs[i]].closeTimestamp, "Round has not ended");
             require(!rounds[epochs[i]].oraclesCalled, "Oracles not called");
             require(refundable(epochs[i], msg.sender), "Not eligible for refund");
-
+            
             ledger[epochs[i]][msg.sender].claimed = true;
-            reward += minBetAmount;
+            reward += ledger[epochs[i]][msg.sender].amount;
 
-            emit Claim(msg.sender, epochs[i], minBetAmount);
+            emit Claim(msg.sender, epochs[i], betAmount);
         }
 
         pred.safeTransfer(msg.sender, reward);
@@ -263,7 +341,7 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     function claimTreasury() external nonReentrant onlyAdmin {
         uint256 currentTreasuryAmount = treasuryAmount;
         treasuryAmount = 0;
-        pred.transfer(adminAddress, treasuryAmount);
+        pred.transfer(adminAddress, currentTreasuryAmount);
 
         emit TreasuryClaim(currentTreasuryAmount);
     }
@@ -294,14 +372,14 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Set minBetAmount
+     * @notice Set betAmount
      * @dev Callable by admin
      */
-    function setMinBetAmount(uint256 _minBetAmount) external whenPaused onlyAdmin {
-        require(_minBetAmount != 0, "Must be superior to 0");
-        minBetAmount = _minBetAmount;
+    function setBetAmount(uint256 _betAmount) external whenPaused onlyAdmin {
+        require(_betAmount != 0, "Must be superior to 0");
+        betAmount = _betAmount;
 
-        emit NewMinBetAmount(currentEpoch, minBetAmount);
+        emit NewBetAmount(currentEpoch, betAmount);
     }
 
     /**
@@ -342,6 +420,14 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
 
         emit NewOracleUpdateAllowance(_oracleUpdateAllowance);
     }
+    
+    /**
+     * 
+     */
+     function setTokenMaxBet(uint256 _tokenMaxBet) external whenPaused onlyAdmin {
+         tokenMaxBet = _tokenMaxBet;
+         emit NewTokenMaxBet(_tokenMaxBet);
+     }
 
 
     /**
@@ -371,35 +457,38 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
     function getRound(uint _round) external view 
         returns(
             uint256 epoch,
-            uint256 startTimestamp,
-            uint256 endTimestamp,
+            uint256 lockedTimestamp,
+            uint256 closeTimestamp,
             uint256 totalAmount,
             bool oraclesCalled,
             address[] memory _tokens,
-            int256[] memory startPrices,
-            int256[] memory endPrices,
-            uint256[] memory startOracleIds,
-            uint256[] memory endOracleIds
+            int256[] memory lockedPrices,
+            int256[] memory closePrices,
+            uint256[] memory lockedOracleIds,
+            uint256[] memory closeOracleIds,
+            uint256[] memory bets
         )
     {
         epoch = _round;
         Round storage round = rounds[_round];
-        startTimestamp = round.startTimestamp;
-        endTimestamp = round.endTimestamp;
+        lockedTimestamp = round.lockedTimestamp;
+        closeTimestamp = round.closeTimestamp;
         totalAmount = round.totalAmount;
         oraclesCalled = round.oraclesCalled;
         _tokens = getTokens();
-        startPrices = new int256[](_tokens.length);
-        endPrices = new int256[](_tokens.length);
-        startOracleIds = new uint256[](_tokens.length);
-        endOracleIds = new uint256[](_tokens.length);
+        lockedPrices = new int256[](_tokens.length);
+        closePrices = new int256[](_tokens.length);
+        lockedOracleIds = new uint256[](_tokens.length);
+        closeOracleIds = new uint256[](_tokens.length);
+        bets = new uint256[](_tokens.length);
         
         for ( uint i=0; i< _tokens.length; i++){
             address token = _tokens[i];
-            startPrices[i] = (round.startPrices[token]);
-            endPrices[i] = (round.endPrices[token]);
-            startOracleIds[i] = (round.startOracleIds[token]);
-            endOracleIds[i] = (round.endOracleIds[token]);
+            lockedPrices[i] = (round.lockedPrices[token]);
+            closePrices[i] = (round.closePrices[token]);
+            lockedOracleIds[i] = (round.lockedOracleIds[token]);
+            closeOracleIds[i] = (round.closeOracleIds[token]);
+            bets[i] = round.bets[token];
         }
     }
 
@@ -459,27 +548,54 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
         return
             !round.oraclesCalled &&
             !betInfo.claimed &&
-            block.timestamp > round.endTimestamp + bufferSeconds &&
+            block.timestamp > round.closeTimestamp + bufferSeconds &&
             betInfo.amount != 0;
     }
+    
+    /**
+     * @notice Checks if an address won the last round
+    */
+    
+    function wonLastRound(address winner) external view returns(bool){
+        BetInfo memory betInfo =  ledger[currentEpoch-1][winner];
+        require(betInfo.token != address(0), "Did not predict");
+        if(rounds[currentEpoch-1].lockedPrices[betInfo.token] == 
+            rounds[currentEpoch-1].closePrices[betInfo.token]) return false;
+            
+        Position pos = rounds[currentEpoch-1].lockedPrices[betInfo.token] > 
+            rounds[currentEpoch-1].closePrices[betInfo.token] ? 
+            Position.Bear : Position.Bull;
+        return betInfo.position == pos;
+    }    
+    
+    function lostLastRound(address loser) external view returns(bool){
+        BetInfo memory betInfo =  ledger[currentEpoch-1][loser];
+        require(betInfo.token != address(0), "Did not predict");
+        if(rounds[currentEpoch-1].lockedPrices[betInfo.token] == 
+            rounds[currentEpoch-1].closePrices[betInfo.token]) return true;
+            
+        Position pos = rounds[currentEpoch-1].lockedPrices[betInfo.token] > 
+            rounds[currentEpoch-1].closePrices[betInfo.token] ? 
+            Position.Bear : Position.Bull;
+        return betInfo.position != pos;
+    }   
     
     function _setStartPrices() internal{
         Round storage round = rounds[currentEpoch];
         for (uint i; i < tokens.length; i++){
             address token = tokens[i];
             (uint80 currentRoundId, int256 currentPrice) = _getPriceFromOracle(oracles[token]);
-            round.startPrices[token] = currentPrice;
-            round.startOracleIds[token] = currentRoundId;
+            round.lockedPrices[token] = currentPrice;
+            round.lockedOracleIds[token] = currentRoundId;
         }
     }
     
-    function _setEndPrices() internal{
-        Round storage round = rounds[currentEpoch];
+    function _setEndPrices(Round storage round) internal{
         for (uint i; i < tokens.length; i++){
             address token = tokens[i];
             (uint80 currentRoundId, int256 currentPrice) = _getPriceFromOracle(oracles[token]);
-            round.endPrices[token] = currentPrice;
-            round.endOracleIds[token] = currentRoundId;
+            round.closePrices[token] = currentPrice;
+            round.closeOracleIds[token] = currentRoundId;
         }
     }
 
@@ -488,13 +604,17 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @notice End round
      */
     function _safeEndRound() internal {
-        require(rounds[currentEpoch].startTimestamp != 0, "Can only end round after round has started");
-        require(block.timestamp >= rounds[currentEpoch].endTimestamp, "Can only end round after closeTimestamp");
+        require(rounds[currentEpoch].lockedTimestamp != 0, "Round not started");
+        require(block.timestamp >= rounds[currentEpoch].closeTimestamp, "Not yet closeTimestamp");
         require(
-            block.timestamp <= rounds[currentEpoch].endTimestamp + bufferSeconds,
-            "Can only end round within bufferSeconds"
+            block.timestamp <= rounds[currentEpoch].closeTimestamp + bufferSeconds,
+            "BufferSeconds exceeded"
         );
-        _setEndPrices();
+        
+        Round storage round = rounds[currentEpoch];
+        round.closeTimestamp = block.timestamp;
+        _setEndPrices(round);
+        round.oraclesCalled = true;
     }
 
     /**
@@ -503,9 +623,9 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      * @param epoch: epoch
      */
     function _safeStartRound(uint256 epoch) internal {
-        require(rounds[epoch - 1].endTimestamp != 0, "Can only start round after round n-1 has ended");
+        require(rounds[epoch - 1].closeTimestamp != 0, "Can only start round after round n-1 has ended");
         require(
-            block.timestamp >= rounds[epoch - 1].endTimestamp,
+            block.timestamp >= rounds[epoch - 1].closeTimestamp,
             "Can only start new round after round n-1 endTimestamp"
         );
         _startRound(epoch);
@@ -518,8 +638,8 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      */
     function _startRound(uint256 epoch) internal {
         Round storage round = rounds[epoch];
-        round.startTimestamp = block.timestamp;
-        round.endTimestamp = block.timestamp + intervalSeconds;
+        round.lockedTimestamp = block.timestamp;
+        round.closeTimestamp = block.timestamp + intervalSeconds;
         round.epoch = epoch;
         round.totalAmount = 0;
 
@@ -533,9 +653,9 @@ contract Prediction is Ownable, Pausable, ReentrancyGuard {
      */
     function _bettable(uint256 epoch) internal view returns (bool) {
         return
-            rounds[epoch].startTimestamp != 0 &&
-            block.timestamp > rounds[epoch].startTimestamp &&
-            block.timestamp < rounds[epoch].startTimestamp + 1 hours; 
+            rounds[epoch].lockedTimestamp != 0 &&
+            block.timestamp > rounds[epoch].lockedTimestamp &&
+            block.timestamp < rounds[epoch].lockedTimestamp + 1 hours; 
     }
 
     /**
