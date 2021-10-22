@@ -2,7 +2,10 @@
 pragma solidity ^0.8.0;
 pragma abicoder v2;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "hardhat/console.sol";
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
@@ -70,10 +73,10 @@ contract Prediction is
     PausableUpgradeable, 
     ReentrancyGuardUpgradeable,
     UUPSUpgradeable {
-    using SafeERC20 for IERC20;
+    using SafeERC20Upgradeable for IERC20Upgradeable;
 
 
-    IERC20 public constant pred = IERC20(0xB2d7b35539A543bbE4c74965488fFE33c6721f0d);
+    IERC20Upgradeable public constant pred = IERC20Upgradeable(0xB2d7b35539A543bbE4c74965488fFE33c6721f0d);
     address public constant BNB = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     address public adminAddress; // address of the admin
@@ -216,9 +219,9 @@ contract Prediction is
     function removeTokens(uint[] memory _ids) external whenNotPaused onlyAdmin{
         for (uint i = 0; i < _ids.length; i++){
             require(tokens[_ids[i]] != address(0), "Token not predictable");
+            delete oracles[tokens[_ids[i]]];
             tokens[_ids[i]] = tokens[tokens.length-1];
             tokens.pop();
-            delete oracles[tokens[_ids[i]]];
             emit TokenRemoved(tokens[_ids[i]], address(oracles[tokens[_ids[i]]]));  
         }
     }
@@ -292,9 +295,6 @@ contract Prediction is
         uint256 reward; // Initializes reward
 
         for (uint256 i = 0; i < epochs.length; i++) {
-            require(rounds[epochs[i]].lockedTimestamp != 0, "Round has not started");
-            require(block.timestamp > rounds[epochs[i]].closeTimestamp, "Round has not ended");
-            require(!rounds[epochs[i]].oraclesCalled, "Oracles not called");
             require(refundable(epochs[i], msg.sender), "Not eligible for refund");
             
             ledger[epochs[i]][msg.sender].claimed = true;
@@ -438,7 +438,7 @@ contract Prediction is
      */
     function recoverToken(address _token, uint256 _amount) external onlyOwner {
         require( _token != address(pred), "Pred cannot be recovered");
-        IERC20(_token).safeTransfer(address(msg.sender), _amount);
+        IERC20Upgradeable(_token).safeTransfer(address(msg.sender), _amount);
 
         emit TokenRecovery(_token, _amount);
     }
@@ -559,6 +559,9 @@ contract Prediction is
     function wonLastRound(address winner) external view returns(bool){
         BetInfo memory betInfo =  ledger[currentEpoch-1][winner];
         require(betInfo.token != address(0), "Did not predict");
+        require(!betInfo.claimed, "Claimed Round funds");
+        require(rounds[currentEpoch-1].oraclesCalled, "Oracles not called");
+        
         if(rounds[currentEpoch-1].lockedPrices[betInfo.token] == 
             rounds[currentEpoch-1].closePrices[betInfo.token]) return false;
             
@@ -571,6 +574,9 @@ contract Prediction is
     function lostLastRound(address loser) external view returns(bool){
         BetInfo memory betInfo =  ledger[currentEpoch-1][loser];
         require(betInfo.token != address(0), "Did not predict");
+        require(!betInfo.claimed, "Claimed Round funds");
+        require(rounds[currentEpoch-1].oraclesCalled, "Oracles not called");
+        
         if(rounds[currentEpoch-1].lockedPrices[betInfo.token] == 
             rounds[currentEpoch-1].closePrices[betInfo.token]) return true;
             

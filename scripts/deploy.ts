@@ -20,14 +20,13 @@ async function main() {
   const [signer] = await ethers.getSigners();
   // We get the contract to deploy
   const Prediction = await ethers.getContractFactory("Prediction");
-  console.log(signer.address);
 
   const prediction = await upgrades.deployProxy(
     Prediction,
     [
       signer.address,
       signer.address,
-      86400,
+      1800,
       300,
       ethers.utils.parseUnits("10"),
       100,
