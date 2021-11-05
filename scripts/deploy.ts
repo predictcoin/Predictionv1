@@ -28,6 +28,7 @@ async function main() {
       signer.address,
       1800,
       300,
+      900,
       ethers.utils.parseUnits("10"),
       100,
       10,

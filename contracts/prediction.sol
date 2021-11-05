@@ -84,6 +84,7 @@ contract Prediction is
 
     uint256 public bufferSeconds; // number of seconds for valid execution of a prediction round
     uint256 public intervalSeconds; // interval in seconds between two prediction rounds
+    uint256 public betSeconds; //  amount of time users can bet
 
     uint256 public betAmount; // betting amount (denominated in wei)
     uint256 public treasuryAmount; // treasury amount that was not claimed
@@ -186,6 +187,7 @@ contract Prediction is
         address _operatorAddress,
         uint256 _intervalSeconds,
         uint256 _bufferSeconds,
+        uint256 _betSeconds,
         uint256 _betAmount,
         uint256 _oracleUpdateAllowance,
         uint256 _tokenMaxBet
@@ -200,6 +202,7 @@ contract Prediction is
         betAmount = _betAmount;
         oracleUpdateAllowance = _oracleUpdateAllowance;
         tokenMaxBet = _tokenMaxBet;
+        betSeconds = _betSeconds;
     }
     
     // Authourizes upgrade to be done by the proxy. Theis contract uses a UUPS upgrade model
@@ -209,7 +212,7 @@ contract Prediction is
     function addTokens(address[] memory _tokens, address[] memory _oracles) external whenNotPaused onlyAdmin{
         for (uint i = 0; i < _tokens.length; i++){
             require(_tokens[i] != address(0) && _oracles[i] != address(0), "Predictoin: Cannot add a zero address");
-            require( address(oracles[_tokens[i]]) == address(0), "Predictoin: Cannot readd a token" );
+            require( address(oracles[_tokens[i]]) == address(0), "Predictoin: Cannot read a token" );
             tokens.push(_tokens[i]);
             oracles[_tokens[i]] = AggregatorV3Interface(_oracles[i]);
             emit TokenAdded(_tokens[i], _oracles[i]);
@@ -299,7 +302,6 @@ contract Prediction is
             
             ledger[epochs[i]][msg.sender].claimed = true;
             reward += ledger[epochs[i]][msg.sender].amount;
-
             emit Claim(msg.sender, epochs[i], betAmount);
         }
 
@@ -359,14 +361,16 @@ contract Prediction is
      * @notice Set buffer and interval (in seconds)
      * @dev Callable by admin
      */
-    function setBufferAndIntervalSeconds(uint256 _bufferSeconds, uint256 _intervalSeconds)
+    function setBufferBetAndIntervalSeconds(uint256 _bufferSeconds, uint256 _intervalSeconds, uint256 _betSeconds)
         external
         whenPaused
         onlyAdmin
     {
         require(_bufferSeconds < _intervalSeconds, "bufferSeconds must be inferior to intervalSeconds");
+        require(_betSeconds < _intervalSeconds, "betSeconds must be inferior to intervalSeconds");
         bufferSeconds = _bufferSeconds;
         intervalSeconds = _intervalSeconds;
+        betSeconds = _betSeconds;
 
         emit NewBufferAndIntervalSeconds(_bufferSeconds, _intervalSeconds);
     }
@@ -661,7 +665,7 @@ contract Prediction is
         return
             rounds[epoch].lockedTimestamp != 0 &&
             block.timestamp > rounds[epoch].lockedTimestamp &&
-            block.timestamp < rounds[epoch].lockedTimestamp + 1 hours; 
+            block.timestamp < rounds[epoch].lockedTimestamp + betSeconds; 
     }
 
     /**
