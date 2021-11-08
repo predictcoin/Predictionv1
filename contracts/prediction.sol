@@ -76,7 +76,7 @@ contract Prediction is
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
 
-    IERC20Upgradeable public constant pred = IERC20Upgradeable(0xB2d7b35539A543bbE4c74965488fFE33c6721f0d);
+    IERC20Upgradeable public constant pred = IERC20Upgradeable(0x68019BfEE351189B7307c69303b91AA0e1Ff4F74);
     address public constant BNB = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     address public adminAddress; // address of the admin
@@ -118,6 +118,8 @@ contract Prediction is
         mapping(address => uint256) lockedOracleIds;
         mapping(address => uint256) closeOracleIds;
         mapping(address => uint256) bets;
+        mapping(address => uint256) bulls;
+        mapping(address => uint256) bears;
         mapping(address => int) lockedPrices;
         mapping(address => int) closePrices;
     }
@@ -129,8 +131,8 @@ contract Prediction is
         bool claimed; // default false
     }
 
-    event BetBear(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
-    event BetBull(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
+    event PredictBear(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
+    event PredictBull(address indexed sender, uint256 indexed epoch, address indexed token, uint256 amount);
     event Claim(address indexed sender, uint256 indexed epoch, uint256 amount);
     event EndRound(uint256 indexed epoch, uint256 indexed roundId, int256 price);
 
@@ -250,6 +252,7 @@ contract Prediction is
         Round storage round = rounds[epoch];
         round.totalAmount = round.totalAmount + amount;
         rounds[epoch].bets[token] += 1;
+        rounds[epoch].bears[token] +=1;
 
         // Update user data
         BetInfo storage betInfo = ledger[epoch][msg.sender];
@@ -258,7 +261,7 @@ contract Prediction is
         betInfo.token = token;
         userRounds[msg.sender].push(epoch);
 
-        emit BetBear(msg.sender, epoch, msg.sender, amount);
+        emit PredictBear(msg.sender, epoch, token, amount);
     }
 
     /**
@@ -278,6 +281,7 @@ contract Prediction is
         Round storage round = rounds[epoch];
         round.totalAmount = round.totalAmount + amount;
         rounds[epoch].bets[token] += 1;
+        rounds[epoch].bulls[token] +=1;
 
         // Update user data
         BetInfo storage betInfo = ledger[epoch][msg.sender];
@@ -286,7 +290,7 @@ contract Prediction is
         betInfo.token = token;
         userRounds[msg.sender].push(epoch);
 
-        emit BetBull(msg.sender, epoch, msg.sender, amount);
+        emit PredictBull(msg.sender, epoch, token, amount);
     }
     
 
@@ -495,6 +499,26 @@ contract Prediction is
             bets[i] = round.bets[token];
         }
     }
+    
+    function getStats(uint _round) external view
+        returns(
+            address[] memory _tokens,
+            uint256[] memory bulls,
+            uint256[] memory bears
+            )
+        {   
+            _tokens = getTokens();
+            bulls = new uint256[](_tokens.length);
+            bears = new uint256[](_tokens.length);
+            Round storage round = rounds[_round];
+            
+            for(uint i = 0; i < _tokens.length; i++){
+                address token = _tokens[i];
+                bulls[i] = round.bulls[token];
+                bears[i] = round.bears[token];
+            }
+        }
+
 
     /**
      * @notice Returns round epochs and bet information for a user that has participated

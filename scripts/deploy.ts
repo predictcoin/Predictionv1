@@ -36,7 +36,7 @@ async function main() {
     { kind: "uups" }
   );
 
-  prediction.addTokens(tokens, oracles);
+  await prediction.addTokens(tokens, oracles);
 
   console.log(
     `Prediction deployed to:${prediction.address}`,
